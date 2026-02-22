@@ -107,7 +107,7 @@ export default function NurseDashboard() {
     let nurseId = null
     try { nurseId = JSON.parse(atob(token.split('.')[1])).id } catch {}
 
-    const socket = io(SOCKET_URL)
+    const socket = io(SOCKET_URL, { transports: ['websocket'] })
     socketRef.current = socket
 
     // Регистрируем медсестру при каждом (ре)коннекте и восстанавливаем комнату заказа
