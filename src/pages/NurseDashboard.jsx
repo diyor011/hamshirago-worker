@@ -238,8 +238,15 @@ export default function NurseDashboard() {
         setPushStatus('denied'); return
       }
 
-      const reg = await navigator.serviceWorker.register('/sw.js')
-      await navigator.serviceWorker.ready
+      const reg = await Promise.race([
+        navigator.serviceWorker.register('/sw.js'),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('SW register timeout')), 5000)),
+      ])
+      // Ждём активации SW макс 4с; если завис — продолжаем всё равно (мобильный Safari)
+      await Promise.race([
+        navigator.serviceWorker.ready,
+        new Promise(resolve => setTimeout(resolve, 4000)),
+      ])
 
       const { data } = await api.get('/nurses/vapid-key')
       if (!data.publicKey) { setPushStatus('unavailable'); return }
@@ -288,7 +295,7 @@ export default function NurseDashboard() {
         try {
           await api.put('/nurses/duty', { available: true, lat: pos.coords.latitude, lng: pos.coords.longitude })
           setIsOnDuty(true)
-          await registerPush()
+          // registerPush() вызывается в useEffect([isOnDuty]) — не дублируем
         } catch { setGpsError('Ошибка сервера') }
         setLoading(false)
       },
