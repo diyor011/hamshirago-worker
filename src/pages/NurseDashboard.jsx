@@ -15,29 +15,44 @@ function getAudioCtx() {
   return _audioCtx
 }
 
-// Приятный звук уведомления о новом заказе (Web Audio API)
+// Хранит все осцилляторы текущего звука (чтобы можно было остановить)
+let _activeOscillators = []
+
+export function stopOrderSound() {
+  _activeOscillators.forEach(osc => { try { osc.stop() } catch {} })
+  _activeOscillators = []
+}
+
+// Громкое уведомление — повторяется 15 секунд
 async function playOrderSound() {
   try {
     const ctx = getAudioCtx()
-    // Браузер мог заблокировать — разбудим
     if (ctx.state === 'suspended') await ctx.resume()
 
-    // Восходящий мажорный аккорд: До-Ми-Соль (C5-E5-G5)
-    const notes = [523.25, 659.25, 783.99]
-    notes.forEach((freq, i) => {
-      const osc = ctx.createOscillator()
-      const gain = ctx.createGain()
-      osc.connect(gain)
-      gain.connect(ctx.destination)
-      osc.type = 'sine'
-      osc.frequency.value = freq
-      const t = ctx.currentTime + i * 0.18
-      gain.gain.setValueAtTime(0, t)
-      gain.gain.linearRampToValueAtTime(0.28, t + 0.04)
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.55)
-      osc.start(t)
-      osc.stop(t + 0.6)
-    })
+    stopOrderSound()
+
+    const totalDuration = 15      // секунд
+    const beatInterval = 1.0      // повтор каждую секунду
+    const notes = [660, 880, 1100] // E5-A5-C#6 — резкий, слышимый сигнал
+
+    for (let beat = 0; beat < totalDuration; beat++) {
+      notes.forEach((freq, i) => {
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.connect(gain)
+        gain.connect(ctx.destination)
+        osc.type = 'square' // более резкий звук чем sine
+        osc.frequency.value = freq
+
+        const t = ctx.currentTime + beat * beatInterval + i * 0.12
+        gain.gain.setValueAtTime(0, t)
+        gain.gain.linearRampToValueAtTime(0.7, t + 0.02)  // громко
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.35)
+        osc.start(t)
+        osc.stop(t + 0.4)
+        _activeOscillators.push(osc)
+      })
+    }
   } catch {}
 }
 
@@ -137,7 +152,7 @@ export default function NurseDashboard() {
 
   useEffect(() => {
     if (!incomingOrder) return
-    if (countdown <= 0) { setIncomingOrder(null); return }
+    if (countdown <= 0) { stopOrderSound(); setIncomingOrder(null); return }
     const t = setTimeout(() => setCountdown(c => c - 1), 1000)
     return () => clearTimeout(t)
   }, [incomingOrder, countdown])
@@ -194,6 +209,7 @@ export default function NurseDashboard() {
   }
 
   const acceptOrder = () => {
+    stopOrderSound()
     socketRef.current?.emit('order:accept', { orderId: incomingOrder.orderId })
     socketRef.current?.emit('order:watch', { orderId: incomingOrder.orderId })
     setActiveOrder(incomingOrder)
@@ -202,6 +218,7 @@ export default function NurseDashboard() {
   }
 
   const declineOrder = () => {
+    stopOrderSound()
     socketRef.current?.emit('order:decline', { orderId: incomingOrder.orderId })
     setIncomingOrder(null)
   }
