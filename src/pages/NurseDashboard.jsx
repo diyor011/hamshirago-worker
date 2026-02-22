@@ -69,6 +69,10 @@ export default function NurseDashboard() {
   const [loading, setLoading] = useState(false)
   const [gpsError, setGpsError] = useState('')
   const [pushStatus, setPushStatus] = useState('unknown') // 'active' | 'denied' | 'unavailable' | 'unknown'
+  // iOS: сайт открыт в браузере Safari, не в PWA-режиме
+  const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent)
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true
+  const showIosInstallHint = isIos && !isStandalone && pushStatus === 'unavailable'
   const [incomingOrder, setIncomingOrder] = useState(null)
   const [activeOrder, setActiveOrder] = useState(() => {
     try { return JSON.parse(localStorage.getItem('nurse_order')) } catch { return null }
@@ -413,6 +417,19 @@ export default function NurseDashboard() {
                   {pushStatus === 'active' ? 'Уведомления включены' : pushStatus === 'denied' ? 'Заблокированы — разрешите в настройках браузера' : pushStatus === 'unavailable' ? 'Уведомления недоступны в этом браузере' : 'Подключаем уведомления...'}
                 </span>
               </div>
+
+              {/* iOS: инструкция добавить на главный экран */}
+              {showIosInstallHint && (
+                <div style={{ background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.25)', borderRadius: 12, padding: '12px 14px', marginBottom: 12 }}>
+                  <div style={{ color: '#FBBF24', fontWeight: 700, fontSize: 13, marginBottom: 6 }}>📲 Для уведомлений на iPhone:</div>
+                  <div style={{ color: 'rgba(255,255,255,0.6)', fontSize: 12, lineHeight: 1.6 }}>
+                    1. Нажмите <strong style={{ color: 'white' }}>Поделиться</strong> (кнопка <strong style={{ color: 'white' }}>⎋</strong> внизу Safari)<br />
+                    2. Выберите <strong style={{ color: 'white' }}>«На экран Домой»</strong><br />
+                    3. Откройте приложение с главного экрана
+                  </div>
+                </div>
+              )}
+
               <div style={{ display: 'flex', gap: 8 }}>
                 <motion.button whileTap={{ scale: 0.97 }} onClick={toggleDuty}
                   style={{ flex: 1, padding: '13px', borderRadius: 14, border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)', color: '#FCA5A5', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
