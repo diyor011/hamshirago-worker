@@ -6,54 +6,54 @@ import api from '../api/axios'
 
 const SOCKET_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3001/api').replace('/api', '')
 
-// AudioContext — создаём один раз при первом взаимодействии пользователя
-let _audioCtx = null
-function getAudioCtx() {
-  if (!_audioCtx) {
-    _audioCtx = new (window.AudioContext || window.webkitAudioContext)()
-  }
-  return _audioCtx
-}
-
-// Хранит все осцилляторы текущего звука (чтобы можно было остановить)
+// ── Звук уведомления ──
+// Если положить файл в workers/public/sounds/notify.mp3 — играет он.
+// Если файла нет — автоматически играет встроенный синтезированный звук.
+let _audio = null
+let _audioRepeatTimer = null
 let _activeOscillators = []
 
 export function stopOrderSound() {
-  _activeOscillators.forEach(osc => { try { osc.stop() } catch {} })
+  if (_audio) { _audio.pause(); _audio.currentTime = 0; _audio = null }
+  if (_audioRepeatTimer) { clearTimeout(_audioRepeatTimer); _audioRepeatTimer = null }
+  _activeOscillators.forEach(o => { try { o.stop() } catch {} })
   _activeOscillators = []
 }
 
-// Громкое уведомление — повторяется 15 секунд
-async function playOrderSound() {
+function playSynthSound() {
   try {
-    const ctx = getAudioCtx()
-    if (ctx.state === 'suspended') await ctx.resume()
-
-    stopOrderSound()
-
-    const totalDuration = 15      // секунд
-    const beatInterval = 1.0      // повтор каждую секунду
-    const notes = [660, 880, 1100] // E5-A5-C#6 — резкий, слышимый сигнал
-
-    for (let beat = 0; beat < totalDuration; beat++) {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)()
+    const notes = [660, 880, 1100]
+    for (let beat = 0; beat < 15; beat++) {
       notes.forEach((freq, i) => {
         const osc = ctx.createOscillator()
         const gain = ctx.createGain()
-        osc.connect(gain)
-        gain.connect(ctx.destination)
-        osc.type = 'square' // более резкий звук чем sine
-        osc.frequency.value = freq
-
-        const t = ctx.currentTime + beat * beatInterval + i * 0.12
+        osc.connect(gain); gain.connect(ctx.destination)
+        osc.type = 'square'; osc.frequency.value = freq
+        const t = ctx.currentTime + beat * 1.0 + i * 0.12
         gain.gain.setValueAtTime(0, t)
-        gain.gain.linearRampToValueAtTime(0.7, t + 0.02)  // громко
+        gain.gain.linearRampToValueAtTime(0.7, t + 0.02)
         gain.gain.exponentialRampToValueAtTime(0.001, t + 0.35)
-        osc.start(t)
-        osc.stop(t + 0.4)
+        osc.start(t); osc.stop(t + 0.4)
         _activeOscillators.push(osc)
       })
     }
   } catch {}
+}
+
+async function playOrderSound() {
+  stopOrderSound()
+  try {
+    const audio = new Audio('/sounds/notify.mp3')
+    audio.volume = 1.0
+    audio.loop = true
+    await audio.play()   // если файла нет — выбросит исключение
+    _audio = audio
+    _audioRepeatTimer = setTimeout(stopOrderSound, 15000)
+  } catch {
+    // Файла нет — играем синтезированный звук
+    playSynthSound()
+  }
 }
 
 const STATUS_STEPS = [
@@ -68,6 +68,7 @@ export default function NurseDashboard() {
   const [isOnDuty, setIsOnDuty] = useState(false)
   const [loading, setLoading] = useState(false)
   const [gpsError, setGpsError] = useState('')
+  const [pushStatus, setPushStatus] = useState('unknown') // 'active' | 'denied' | 'unavailable' | 'unknown'
   const [incomingOrder, setIncomingOrder] = useState(null)
   const [activeOrder, setActiveOrder] = useState(() => {
     try { return JSON.parse(localStorage.getItem('nurse_order')) } catch { return null }
@@ -92,13 +93,6 @@ export default function NurseDashboard() {
     api.get('/nurses/me')
       .then(r => { setNurse(r.data); setIsOnDuty(r.data.isAvailable) })
       .catch(() => navigate('/login'))
-  }, [])
-
-  // Инициализируем AudioContext при первом клике (требование браузера)
-  useEffect(() => {
-    const init = () => { getAudioCtx(); document.removeEventListener('click', init) }
-    document.addEventListener('click', init)
-    return () => document.removeEventListener('click', init)
   }, [])
 
   // Персистим активный заказ в localStorage
@@ -188,23 +182,118 @@ export default function NurseDashboard() {
     return () => { if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current) }
   }, [activeOrder])
 
-  const toggleDuty = () => {
+  // ── FIX 1: SW message listener — всегда активен, не только при registerPush ──
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return
+    const handler = (event) => {
+      if (event.data?.type === 'ORDER_INCOMING' && event.data.payload) {
+        setIncomingOrder(event.data.payload)
+        setCountdown(90)
+        playOrderSound()
+      }
+    }
+    navigator.serviceWorker.addEventListener('message', handler)
+    return () => navigator.serviceWorker.removeEventListener('message', handler)
+  }, [])
+
+  // ── FIX 2: Читаем IndexedDB при открытии и фокусе — 5 мин окно ──
+  useEffect(() => {
+    const readPendingOrder = () => {
+      try {
+        const req = indexedDB.open('hamshirago', 1)
+        req.onsuccess = (e) => {
+          const db = e.target.result
+          if (!db.objectStoreNames.contains('pending')) return
+          const tx = db.transaction('pending', 'readwrite')
+          const store = tx.objectStore('pending')
+          const get = store.get('order')
+          get.onsuccess = () => {
+            const rec = get.result
+            if (!rec) return
+            // Заказ актуален 5 минут
+            if (Date.now() - rec.ts < 300000 && rec.payload) {
+              store.delete('order')
+              setIncomingOrder(rec.payload)
+              setCountdown(90)
+              playOrderSound()
+            } else {
+              store.delete('order')
+            }
+          }
+        }
+      } catch {}
+    }
+    readPendingOrder()
+    window.addEventListener('focus', readPendingOrder)
+    return () => window.removeEventListener('focus', readPendingOrder)
+  }, [])
+
+  // Подписка на push (без запроса разрешения — разрешение берём в toggleDuty в момент клика)
+  const registerPush = async () => {
+    try {
+      if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+        setPushStatus('unavailable'); return
+      }
+      if (Notification.permission !== 'granted') {
+        setPushStatus('denied'); return
+      }
+
+      const reg = await navigator.serviceWorker.register('/sw.js')
+      await navigator.serviceWorker.ready
+
+      const { data } = await api.get('/nurses/vapid-key')
+      if (!data.publicKey) { setPushStatus('unavailable'); return }
+
+      const urlBase64ToUint8Array = (b) => {
+        const pad = '='.repeat((4 - b.length % 4) % 4)
+        const base64 = (b + pad).replace(/-/g, '+').replace(/_/g, '/')
+        return Uint8Array.from([...atob(base64)].map(c => c.charCodeAt(0)))
+      }
+
+      const subscription = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(data.publicKey),
+      })
+
+      await api.post('/nurses/push-subscribe', subscription.toJSON())
+      setPushStatus('active')
+      console.log('✅ Push подключён')
+    } catch (err) {
+      console.warn('Push ошибка:', err.message)
+      setPushStatus('unavailable')
+    }
+  }
+
+  // При загрузке страницы — если уже на найме, переподписываемся (без диалога)
+  useEffect(() => {
+    if (isOnDuty) registerPush()
+  }, [isOnDuty])
+
+  const toggleDuty = async () => {
     if (isOnDuty) {
       api.put('/nurses/duty', { available: false })
       setIsOnDuty(false)
+      setPushStatus('unknown')
       return
     }
+
+    // ── ВАЖНО: запрашиваем разрешение ЗДЕСЬ — прямо в обработчике клика ──
+    if ('Notification' in window && Notification.permission === 'default') {
+      await Notification.requestPermission()
+    }
+
     setLoading(true); setGpsError('')
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
         try {
           await api.put('/nurses/duty', { available: true, lat: pos.coords.latitude, lng: pos.coords.longitude })
           setIsOnDuty(true)
+          await registerPush()
         } catch { setGpsError('Ошибка сервера') }
         setLoading(false)
       },
       () => { setGpsError('Разрешите доступ к геолокации'); setLoading(false) },
-      { enableHighAccuracy: true }
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
     )
   }
 
@@ -295,11 +384,30 @@ export default function NurseDashboard() {
                   style={{ width: 10, height: 10, borderRadius: '50%', background: '#10B981', boxShadow: '0 0 10px #10B981' }} />
                 <span style={{ color: '#34D399', fontWeight: 800, fontSize: 15 }}>Вы в режиме ожидания</span>
               </div>
-              <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, marginBottom: 16 }}>Ожидаем входящие заказы рядом с вами...</p>
-              <motion.button whileTap={{ scale: 0.97 }} onClick={toggleDuty}
-                style={{ width: '100%', padding: '13px', borderRadius: 14, border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)', color: '#FCA5A5', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
-                Завершить смену
-              </motion.button>
+              <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, marginBottom: 12 }}>Ожидаем входящие заказы рядом с вами...</p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 16, padding: '8px 12px', borderRadius: 10, background: pushStatus === 'active' ? 'rgba(16,185,129,0.08)' : pushStatus === 'denied' ? 'rgba(239,68,68,0.08)' : 'rgba(245,158,11,0.08)', border: `1px solid ${pushStatus === 'active' ? 'rgba(16,185,129,0.2)' : pushStatus === 'denied' ? 'rgba(239,68,68,0.2)' : 'rgba(245,158,11,0.2)'}` }}>
+                <span style={{ fontSize: 14 }}>{pushStatus === 'active' ? '🔔' : pushStatus === 'denied' ? '🔕' : '⏳'}</span>
+                <span style={{ fontSize: 12, fontWeight: 600, color: pushStatus === 'active' ? '#34D399' : pushStatus === 'denied' ? '#FCA5A5' : '#FCD34D' }}>
+                  {pushStatus === 'active' ? 'Уведомления включены' : pushStatus === 'denied' ? 'Уведомления заблокированы — разрешите в настройках браузера' : 'Подключаем уведомления...'}
+                </span>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <motion.button whileTap={{ scale: 0.97 }} onClick={toggleDuty}
+                  style={{ flex: 1, padding: '13px', borderRadius: 14, border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)', color: '#FCA5A5', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
+                  Завершить смену
+                </motion.button>
+                <motion.button whileTap={{ scale: 0.97 }} onClick={async () => {
+                  try {
+                    const r = await api.post('/nurses/push-test')
+                    alert(r.data.message)
+                  } catch (e) {
+                    alert(e.response?.data?.message || 'Ошибка: ' + e.message)
+                  }
+                }}
+                  style={{ padding: '13px 14px', borderRadius: 14, border: '1px solid rgba(59,130,246,0.3)', background: 'rgba(59,130,246,0.08)', color: '#93C5FD', fontSize: 13, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                  🔔 Тест
+                </motion.button>
+              </div>
             </div>
           )}
           {gpsError && <p style={{ color: '#FCA5A5', fontSize: 13, marginTop: 10, textAlign: 'center' }}>{gpsError}</p>}
@@ -364,6 +472,12 @@ export default function NurseDashboard() {
                 </div>
               </div>
 
+              {incomingOrder.bonus && (
+                <div style={{ background: 'rgba(251,191,36,0.12)', border: '1px solid rgba(251,191,36,0.3)', borderRadius: 12, padding: '10px 14px', marginBottom: 14, textAlign: 'center' }}>
+                  <span style={{ color: '#FBBF24', fontWeight: 800, fontSize: 14 }}>🎁 Бонус за дальнюю поездку!</span>
+                  <div style={{ color: 'rgba(251,191,36,0.7)', fontSize: 12, marginTop: 3 }}>Клиент далеко — вы получите повышенную оплату</div>
+                </div>
+              )}
               <div style={{ background: 'rgba(255,255,255,0.04)', borderRadius: 16, padding: 16, marginBottom: 20 }}>
                 <div style={{ fontSize: 22, marginBottom: 8 }}>{incomingOrder.service?.icon}</div>
                 <div style={{ color: 'white', fontWeight: 800, fontSize: 18, marginBottom: 6 }}>{incomingOrder.service?.name}</div>
