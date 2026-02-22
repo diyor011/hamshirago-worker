@@ -232,24 +232,37 @@ export default function NurseDashboard() {
   const registerPush = async () => {
     try {
       if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+        console.warn('Push: SW или PushManager недоступен')
         setPushStatus('unavailable'); return
       }
       if (Notification.permission !== 'granted') {
+        console.warn('Push: разрешение не выдано:', Notification.permission)
         setPushStatus('denied'); return
       }
 
-      const reg = await Promise.race([
-        navigator.serviceWorker.register('/sw.js'),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('SW register timeout')), 5000)),
-      ])
-      // Ждём активации SW макс 4с; если завис — продолжаем всё равно (мобильный Safari)
-      await Promise.race([
-        navigator.serviceWorker.ready,
-        new Promise(resolve => setTimeout(resolve, 4000)),
-      ])
+      // Регистрируем SW (или получаем существующую регистрацию)
+      await navigator.serviceWorker.register('/sw.js')
+
+      // Получаем активную регистрацию: ждём ready с таймаутом,
+      // при таймауте fallback на getRegistration — избегаем subscribe на неактивном SW
+      let activeReg
+      try {
+        activeReg = await Promise.race([
+          navigator.serviceWorker.ready,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('SW ready timeout')), 7000)),
+        ])
+      } catch {
+        console.warn('Push: navigator.serviceWorker.ready завис, пробуем getRegistration')
+        activeReg = await navigator.serviceWorker.getRegistration('/')
+      }
+
+      if (!activeReg?.active) {
+        console.warn('Push: нет активного SW')
+        setPushStatus('unavailable'); return
+      }
 
       const { data } = await api.get('/nurses/vapid-key')
-      if (!data.publicKey) { setPushStatus('unavailable'); return }
+      if (!data.publicKey) { console.warn('Push: нет VAPID-ключа'); setPushStatus('unavailable'); return }
 
       const urlBase64ToUint8Array = (b) => {
         const pad = '='.repeat((4 - b.length % 4) % 4)
@@ -257,14 +270,14 @@ export default function NurseDashboard() {
         return Uint8Array.from([...atob(base64)].map(c => c.charCodeAt(0)))
       }
 
-      const subscription = await reg.pushManager.subscribe({
+      const subscription = await activeReg.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: urlBase64ToUint8Array(data.publicKey),
       })
 
       await api.post('/nurses/push-subscribe', subscription.toJSON())
       setPushStatus('active')
-      console.log('✅ Push подключён')
+      console.log('✅ Push подключён:', subscription.endpoint.slice(0, 60))
     } catch (err) {
       console.warn('Push ошибка:', err.message)
       setPushStatus('unavailable')
@@ -392,10 +405,12 @@ export default function NurseDashboard() {
                 <span style={{ color: '#34D399', fontWeight: 800, fontSize: 15 }}>Вы в режиме ожидания</span>
               </div>
               <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, marginBottom: 12 }}>Ожидаем входящие заказы рядом с вами...</p>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 16, padding: '8px 12px', borderRadius: 10, background: pushStatus === 'active' ? 'rgba(16,185,129,0.08)' : pushStatus === 'denied' ? 'rgba(239,68,68,0.08)' : 'rgba(245,158,11,0.08)', border: `1px solid ${pushStatus === 'active' ? 'rgba(16,185,129,0.2)' : pushStatus === 'denied' ? 'rgba(239,68,68,0.2)' : 'rgba(245,158,11,0.2)'}` }}>
-                <span style={{ fontSize: 14 }}>{pushStatus === 'active' ? '🔔' : pushStatus === 'denied' ? '🔕' : '⏳'}</span>
-                <span style={{ fontSize: 12, fontWeight: 600, color: pushStatus === 'active' ? '#34D399' : pushStatus === 'denied' ? '#FCA5A5' : '#FCD34D' }}>
-                  {pushStatus === 'active' ? 'Уведомления включены' : pushStatus === 'denied' ? 'Уведомления заблокированы — разрешите в настройках браузера' : 'Подключаем уведомления...'}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 16, padding: '8px 12px', borderRadius: 10,
+                background: pushStatus === 'active' ? 'rgba(16,185,129,0.08)' : pushStatus === 'denied' ? 'rgba(239,68,68,0.08)' : pushStatus === 'unavailable' ? 'rgba(239,68,68,0.06)' : 'rgba(245,158,11,0.08)',
+                border: `1px solid ${pushStatus === 'active' ? 'rgba(16,185,129,0.2)' : pushStatus === 'denied' || pushStatus === 'unavailable' ? 'rgba(239,68,68,0.2)' : 'rgba(245,158,11,0.2)'}` }}>
+                <span style={{ fontSize: 14 }}>{pushStatus === 'active' ? '🔔' : pushStatus === 'denied' || pushStatus === 'unavailable' ? '🔕' : '⏳'}</span>
+                <span style={{ fontSize: 12, fontWeight: 600, color: pushStatus === 'active' ? '#34D399' : pushStatus === 'denied' || pushStatus === 'unavailable' ? '#FCA5A5' : '#FCD34D' }}>
+                  {pushStatus === 'active' ? 'Уведомления включены' : pushStatus === 'denied' ? 'Заблокированы — разрешите в настройках браузера' : pushStatus === 'unavailable' ? 'Уведомления недоступны в этом браузере' : 'Подключаем уведомления...'}
                 </span>
               </div>
               <div style={{ display: 'flex', gap: 8 }}>
